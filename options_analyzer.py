@@ -15,8 +15,7 @@ import sys
 
 # Параметры конфигурации
 TICKERS = [
-    'GLDRUB_TOM', 'USD000UTSTOM', 'EUR_RUB__TOM', 'CNYRUB_TOM', 'T', 'SBERP', 'ABIO',
-    'YDEX', 'SBER', 'TATN', 'TATNP', 'SVCB', 'FEES', 'AFKS', 'POSI', 'RTKM',
+    'T', 'SBERP', 'ABIO','YDEX', 'SBER', 'TATN', 'TATNP', 'SVCB', 'FEES', 'AFKS', 'POSI', 'RTKM',
     'MGNT', 'PHOR', 'SNGS', 'SNGSP', 'MSNG', 'IRAO', 'VKCO', 'CHMF', 'RUAL',
     'GMKN', 'SMLT', 'NLMK', 'LKOH', 'NVTK', 'VTBR', 'SIBN', 'ALRS', 'PIKK',
     'AFLT', 'GAZP', 'ROSN', 'MTLR', 'MTSS', 'MOEX', 'MAGN'
@@ -111,6 +110,40 @@ def get_options_data(ticker, exp_date):
         print(f"⚠️  Неожиданная ошибка при запросе {url}: {e}")
         return pd.DataFrame()
 
+def get_latest_quote(ticker):
+    """
+    Получение последней котировки для указанного тикера
+    """
+    url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json?iss.reverse=true"
+    try:
+        time.sleep(WAIT)
+        response = requests.get(url, timeout=30)
+        if response.status_code != 200:
+            print(f"⚠️  Ошибка при запросе последней котировки для {ticker}: статус {response.status_code}")
+            return None, None
+        data = response.json()
+        if 'candles' not in data or 'data' not in data['candles'] or not data['candles']['data']:
+            print(f"⚠️  Нет данных о свечах для {ticker}")
+            return None, None
+        # Последняя свеча находится в начале, так как iss.reverse=true
+        latest_candle = data['candles']['data'][0]
+        # Индексы для close и end (datetime) из метаданных
+        columns = data['candles']['columns']
+        close_index = columns.index('close')
+        end_index = columns.index('end')
+        last_price = latest_candle[close_index]
+        last_price_datetime = latest_candle[end_index]
+        return last_price, last_price_datetime
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️  Ошибка сети при запросе последней котировки для {ticker}: {e}")
+        return None, None
+    except json.JSONDecodeError as e:
+        print(f"⚠️  Ошибка парсинга JSON для последней котировки {ticker}: {e}")
+        return None, None
+    except Exception as e:
+        print(f"⚠️  Неожиданная ошибка при запросе последней котировки для {ticker}: {e}")
+        return None, None
+
 def analyze_options():
     """
     Основная функция анализа опционов
@@ -122,6 +155,13 @@ def analyze_options():
     # Обработка каждого тикера
     for ticker in tqdm(TICKERS, desc="Обработка тикеров"):
         print(f"\n📊 Обработка тикера: {ticker}")
+
+        last_price, last_price_datetime = get_latest_quote(ticker)
+        if last_price is None:
+            print(f"⚠️  Не удалось получить последнюю котировку для {ticker}, пропускаем.")
+            continue
+
+        print(f"📈 Последняя котировка для {ticker}: {last_price} ({last_price_datetime})")
         
         # Получение дат экспирации
         exp_dates = get_expiration_dates(ticker)
@@ -137,6 +177,8 @@ def analyze_options():
             options_df = get_options_data(ticker, exp_date)
             
             if not options_df.empty:
+                options_df['LAST_PRICE'] = last_price
+                options_df['LAST_PRICE_DATETIME'] = last_price_datetime
                 all_options_data.append(options_df)
     
     if not all_options_data:
@@ -159,14 +201,53 @@ def analyze_options():
         print("❌ Нет записей с ненулевым OFFER")
         return pd.DataFrame()
     
-    print(f"📋 После фильтрации осталось {len(filtered_df)} записей")
+    print(f"📋 После фильтрации по OFFER осталось {len(filtered_df)} записей")
+
+    # Расчет метрик "денежности"
+    filtered_df['PERCENT_DEVIATION'] = (abs(filtered_df['LAST_PRICE'] - filtered_df['STRIKE']) / filtered_df['LAST_PRICE']) * 100
+
+    def get_option_state(row):
+        strike = row['STRIKE']
+        last_price = row['LAST_PRICE']
+        option_type = row['OPTION_TYPE']
+        percent_deviation = row['PERCENT_DEVIATION']
+        
+        # Порог для NTM (Near-the-Money)
+        NTM_THRESHOLD_PERCENT = 10.0 # 10% как указано в задании
+        
+        if option_type == 'CALL':
+            if last_price > strike:
+                return 'ITM'
+            elif percent_deviation <= NTM_THRESHOLD_PERCENT:
+                return 'NTM'
+            else:
+                return 'OTM'
+        elif option_type == 'PUT':
+            if last_price < strike:
+                return 'ITM'
+            elif percent_deviation <= NTM_THRESHOLD_PERCENT:
+                return 'NTM'
+            else:
+                return 'OTM'
+        return 'UNKNOWN'
+
+    filtered_df['STATE'] = filtered_df.apply(get_option_state, axis=1)
+
+    # Фильтрация по ITM и NTM
+    result_df = filtered_df[filtered_df['STATE'].isin(['ITM', 'NTM'])].copy()
+
+    if result_df.empty:
+        print("❌ После фильтрации по ITM/NTM нет данных для анализа")
+        return pd.DataFrame()
+
+    print(f"📋 После фильтрации по ITM/NTM осталось {len(result_df)} записей")
     
     # Расчет разницы между OFFER и THEORPRICE (дисконт)
-    filtered_df['DISCOUNT'] = filtered_df['THEORPRICE'] - filtered_df['OFFER']
-    filtered_df['DISCOUNT_PCT'] = (filtered_df['DISCOUNT'] / filtered_df['THEORPRICE']) * 100
+    result_df['DISCOUNT'] = result_df['THEORPRICE'] - result_df['OFFER']
+    result_df['DISCOUNT_PCT'] = (result_df['DISCOUNT'] / result_df['THEORPRICE']) * 100
     
     # Сортировка по дисконту (от большего к меньшему)
-    result_df = filtered_df.sort_values('DISCOUNT_PCT', ascending=False)
+    result_df = result_df.sort_values('DISCOUNT_PCT', ascending=False)
     
     print(f"✅ Анализ завершен. Найдено {len(result_df)} опционов с дисконтом")
     
@@ -220,6 +301,9 @@ def save_monitoring(df):
                     f.write(f"Дата экспирации: {row['EXP_DATE']}\n")
                     f.write(f"SECID: {row['SECID']}\n")
                     f.write(f"Страйк: {row['STRIKE']:.2f}\n")
+                    f.write(f"Последняя котировка: {row['LAST_PRICE']:.2f} ({row['LAST_PRICE_DATETIME']})\n")
+                    f.write(f"Состояние: {row['STATE']}\n")
+                    f.write(f"Отклонение от цены: {row['PERCENT_DEVIATION']:.2f}%\n")
                     f.write(f"Теоретическая цена: {row['THEORPRICE']:.2f}\n")
                     f.write(f"Оффер: {row['OFFER']:.2f}\n")
                     f.write(f"Дисконт: {row['DISCOUNT']:.2f} ({row['DISCOUNT_PCT']:.2f}%)\n")
